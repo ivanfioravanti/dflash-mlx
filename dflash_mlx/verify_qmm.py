@@ -1,29 +1,29 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
-from __future__ import annotations
 
-import os
+from __future__ import annotations
 
 import mlx.core as mx
 
+from dflash_mlx.internal_debug import (
+    verify_qmm_enabled as _debug_verify_qmm_enabled,
+    verify_qmm_kparts as _debug_verify_qmm_kparts,
+    verify_qmm_variant as _debug_verify_qmm_variant,
+)
 
 def is_enabled() -> bool:
-    return os.environ.get("DFLASH_VERIFY_QMM", "") == "1"
-
+    return _debug_verify_qmm_enabled()
 
 def _variant() -> str:
-    return os.environ.get("DFLASH_VERIFY_VARIANT", "auto")
-
+    return _debug_verify_qmm_variant()
 
 def _auto_variant(K: int, N: int) -> tuple[str, int]:
     if K >= 8192 or N <= 8192:
         return ("mma2big_pipe", 8)
     return ("mma2big", 1)
 
-
 _VERIFY_KERNEL_CACHE: dict[tuple, object] = {}
-
 
 def _build_kernel_mma2big(group_size: int, dtype: mx.Dtype):
     key = ("mma2big", group_size, dtype)
@@ -126,11 +126,7 @@ def _build_kernel_mma2big(group_size: int, dtype: mx.Dtype):
     _VERIFY_KERNEL_CACHE[key] = kernel
     return kernel
 
-
 def _build_kernel_mma2big_8bit(group_size: int, dtype: mx.Dtype):
-    # 8-bit variant: each uint32_t packs 4 bytes → K_by_4 = K/4.
-    # Each thread loads two consecutive uint32_t to cover the same 8 K-positions
-    # as the 4-bit kernel, keeping BK=32 and the simdgroup MMA tile identical.
     key = ("mma2big_8bit", group_size, dtype)
     if key in _VERIFY_KERNEL_CACHE:
         return _VERIFY_KERNEL_CACHE[key]
@@ -232,7 +228,6 @@ def _build_kernel_mma2big_8bit(group_size: int, dtype: mx.Dtype):
     )
     _VERIFY_KERNEL_CACHE[key] = kernel
     return kernel
-
 
 def _build_kernel_mma2big_pipe(group_size: int, dtype: mx.Dtype):
     key = ("mma2big_pipe", group_size, dtype)
@@ -349,10 +344,7 @@ def _build_kernel_mma2big_pipe(group_size: int, dtype: mx.Dtype):
     _VERIFY_KERNEL_CACHE[key] = kernel
     return kernel
 
-
 def _build_kernel_mma2big_pipe_8bit(group_size: int, dtype: mx.Dtype):
-    # 8-bit K-split + double-buffered variant. Same structure as mma2big_pipe
-    # but each thread loads two uint32_t to cover 8 K-positions (4 bytes each).
     key = ("mma2big_pipe_8bit", group_size, dtype)
     if key in _VERIFY_KERNEL_CACHE:
         return _VERIFY_KERNEL_CACHE[key]
@@ -471,7 +463,6 @@ def _build_kernel_mma2big_pipe_8bit(group_size: int, dtype: mx.Dtype):
     _VERIFY_KERNEL_CACHE[key] = kernel
     return kernel
 
-
 def _should_use_verify(
     x: mx.array,
     group_size: int,
@@ -490,7 +481,6 @@ def _should_use_verify(
     for d in x.shape[:-1]:
         m *= d
     return m == 16
-
 
 def verify_matmul(
     x: mx.array,
@@ -523,7 +513,7 @@ def verify_matmul(
     if variant == "auto":
         variant, auto_kp = _auto_variant(K, N)
 
-    K_PARTS = auto_kp if auto_kp is not None else int(os.environ.get("DFLASH_VERIFY_QMM_KPARTS", "4"))
+    K_PARTS = auto_kp if auto_kp is not None else _debug_verify_qmm_kparts(4)
 
     if variant == "mma2big_pipe":
         if N % 32 != 0 or K % (32 * K_PARTS) != 0:

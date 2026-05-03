@@ -8,18 +8,11 @@ from typing import Optional
 
 import mlx.core as mx
 
-
-def _make_gated_delta_kernel_with_tape(
-    *, has_mask: bool = False, vectorized: bool = False
-):
+def _make_gated_delta_kernel_with_tape(*, has_mask: bool = False, vectorized: bool = False):
     if not mx.metal.is_available():
         return None
 
-    mask_load = (
-        "bool do_step = static_cast<float>(mask[b_idx * T + t]) > 0.5f;"
-        if has_mask
-        else "constexpr bool do_step = true;"
-    )
+    mask_source = "mask[b_idx * T + t]" if has_mask else "true"
 
     if vectorized:
         g_comment = "// g: [B, T, Hv, Dk]"
@@ -66,54 +59,39 @@ def _make_gated_delta_kernel_with_tape(
         auto beta_ = beta + b_idx * T * Hv;
 
         for (int t = 0; t < T; ++t) {{
-          {mask_load}
-
-          // Save pre-step state so we can restore it when masked.
-          float old_state[n_per_t];
-          for (int i = 0; i < n_per_t; ++i) {{
-            old_state[i] = state[i];
-          }}
-
-          float out = 0.0f;
           float delta = 0.0f;
-
-          // do_step is a uniform predicate — all threads in the simdgroup
-          // take the same branch, so simd_sum calls are safe inside.
-          if (do_step) {{
+          if ({mask_source}) {{
             float kv_mem = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {{
               auto s_idx = n_per_t * dk_idx + i;
               state[i] = state[i] * {g_access};
-              kv_mem  += state[i] * k_[s_idx];
+              kv_mem += state[i] * k_[s_idx];
             }}
             kv_mem = simd_sum(kv_mem);
 
-            delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
-                    * static_cast<float>(beta_[hv_idx]);
+            delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
 
+            float out = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {{
               auto s_idx = n_per_t * dk_idx + i;
-              state[i] += k_[s_idx] * delta;
-              out      += state[i] * static_cast<float>(q_[s_idx]);
+              state[i] = state[i] + k_[s_idx] * delta;
+              out += state[i] * q_[s_idx];
             }}
             out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {{
+              y[dv_idx] = static_cast<InT>(out);
+            }}
           }}
-
           if (thread_index_in_simdgroup == 0) {{
-            y[dv_idx]     = static_cast<InT>(out);
             tape_[dv_idx] = delta;
           }}
-
-          // Quantize new state, then conditional move: restore old state
-          // when masked so decay and quantization are fully skipped.
           for (int i = 0; i < n_per_t; ++i) {{
-            float quant_new = static_cast<float>(static_cast<InT>(state[i]));
-            state[i] = metal::select(old_state[i], quant_new, do_step);
+            state[i] = static_cast<float>(static_cast<InT>(state[i]));
           }}
-          q_    += Hk * Dk;
-          k_    += Hk * Dk;
-          v_    += Hv * Dv;
-          y     += Hv * Dv;
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
           tape_ += Hv * Dv;
           {g_advance}
           beta_ += Hv;
@@ -142,20 +120,10 @@ def _make_gated_delta_kernel_with_tape(
         source=source,
     )
 
-
-_gated_delta_tape_kernel = _make_gated_delta_kernel_with_tape(
-    has_mask=False, vectorized=False
-)
-_gated_delta_tape_kernel_masked = _make_gated_delta_kernel_with_tape(
-    has_mask=True, vectorized=False
-)
-_gated_delta_tape_kernel_vec = _make_gated_delta_kernel_with_tape(
-    has_mask=False, vectorized=True
-)
-_gated_delta_tape_kernel_vec_masked = _make_gated_delta_kernel_with_tape(
-    has_mask=True, vectorized=True
-)
-
+_gated_delta_tape_kernel = _make_gated_delta_kernel_with_tape(has_mask=False, vectorized=False)
+_gated_delta_tape_kernel_masked = _make_gated_delta_kernel_with_tape(has_mask=True, vectorized=False)
+_gated_delta_tape_kernel_vec = _make_gated_delta_kernel_with_tape(has_mask=False, vectorized=True)
+_gated_delta_tape_kernel_vec_masked = _make_gated_delta_kernel_with_tape(has_mask=True, vectorized=True)
 
 def _gated_delta_ops_with_tape(
     q: mx.array,
@@ -200,7 +168,6 @@ def _gated_delta_ops_with_tape(
         outputs.append(y)
         tape.append(delta.astype(mx.float32))
     return mx.stack(outputs, axis=1), state, mx.stack(tape, axis=1)
-
 
 def gated_delta_kernel_with_tape(
     q: mx.array,
@@ -252,16 +219,11 @@ def gated_delta_kernel_with_tape(
         output_dtypes=[input_type, input_type, mx.float32],
     )
 
-
 def _make_tape_replay_kernel(*, has_mask: bool = False, vectorized: bool = False):
     if not mx.metal.is_available():
         return None
 
-    mask_load = (
-        "bool do_step = static_cast<float>(mask[b_idx * T + t]) > 0.5f;"
-        if has_mask
-        else "constexpr bool do_step = true;"
-    )
+    mask_source = "mask[b_idx * T + t]" if has_mask else "true"
 
     if vectorized:
         g_comment = "// g: [B, T, Hv, Dk]"
@@ -304,18 +266,19 @@ def _make_tape_replay_kernel(*, has_mask: bool = False, vectorized: bool = False
         {g_setup}
 
         for (int t = 0; t < T; ++t) {{
-          {mask_load}
-          float delta = static_cast<float>(tape_[dv_idx]);
-          for (int i = 0; i < n_per_t; ++i) {{
-            auto s_idx = n_per_t * dk_idx + i;
-            float next = state[i] * {g_access} + k_[s_idx] * delta;
-            next = static_cast<float>(static_cast<InT>(next));
-            // Conditional move: old state when masked, next when accepted.
-            // do_step is uniform across the simdgroup — no divergence.
-            state[i] = metal::select(state[i], next, do_step);
+          if ({mask_source}) {{
+            auto delta = static_cast<float>(tape_[dv_idx]);
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] * {g_access};
+              state[i] = state[i] + k_[s_idx] * delta;
+            }}
+            for (int i = 0; i < n_per_t; ++i) {{
+              state[i] = static_cast<float>(static_cast<InT>(state[i]));
+            }}
           }}
           tape_ += Hv * Dv;
-          k_    += Hk * Dk;
+          k_ += Hk * Dk;
           {g_advance}
         }}
 
@@ -342,14 +305,18 @@ def _make_tape_replay_kernel(*, has_mask: bool = False, vectorized: bool = False
         source=source,
     )
 
-
-_tape_replay_kernel = _make_tape_replay_kernel(has_mask=False, vectorized=False)
-_tape_replay_kernel_masked = _make_tape_replay_kernel(has_mask=True, vectorized=False)
-_tape_replay_kernel_vec = _make_tape_replay_kernel(has_mask=False, vectorized=True)
+_tape_replay_kernel = _make_tape_replay_kernel(
+    has_mask=False, vectorized=False
+)
+_tape_replay_kernel_masked = _make_tape_replay_kernel(
+    has_mask=True, vectorized=False
+)
+_tape_replay_kernel_vec = _make_tape_replay_kernel(
+    has_mask=False, vectorized=True
+)
 _tape_replay_kernel_vec_masked = _make_tape_replay_kernel(
     has_mask=True, vectorized=True
 )
-
 
 def _tape_replay_ops(
     tape: mx.array,
@@ -382,7 +349,6 @@ def _tape_replay_ops(
             step_mask = mask[:, t][:, None, None, None]
             state = mx.where(step_mask, state, prev_state)
     return state
-
 
 def tape_replay_kernel(
     tape: mx.array,
@@ -432,13 +398,10 @@ def tape_replay_kernel(
     )
     return state_out
 
-
-def _compute_sdpa_2pass_blocks(
-    gqa_factor: int, n_kv: int, device_arch: Optional[str] = None
-) -> int:
+def _compute_sdpa_2pass_blocks(gqa_factor: int, n_kv: int, device_arch: Optional[str] = None) -> int:
     arch = device_arch or str(mx.device_info().get("architecture", ""))
     devc = arch[-1] if arch else ""
-    n_simds = int(gqa_factor)  # Match AR qL=1 dispatch heuristic.
+    n_simds = int(gqa_factor)
     N = int(n_kv)
 
     if devc == "d":
@@ -466,24 +429,14 @@ def _compute_sdpa_2pass_blocks(
 
     return int(blocks)
 
-
 def _make_batched_sdpa_2pass_partials_kernel(*, has_mask: bool = False):
     if not mx.metal.is_available():
         return None
 
-    mask_setup = (
-        "auto mask_ = mask + (((b_idx * Hq + q_head_idx) * M_FIXED + q_seq_idx) * N + block_idx);"
-        if has_mask
-        else ""
-    )
-    # Branchless mask: float gate fused into score; non-masked path is compile-time constant.
-    mask_gate = (
-        "float mask_gate = static_cast<float>(mask_[0]); use_key = use_key & (mask_gate > Limits<InT>::finite_min);"
-        if has_mask
-        else "constexpr float mask_gate = 0.0f; (void)mask_gate;"
-    )
-    mask_score = "score += mask_gate;" if has_mask else ""
-    mask_advance = "mask_ += blocks;" if has_mask else ""
+    mask_setup = ""
+    mask_use_key = ""
+    mask_score = ""
+    mask_advance = ""
     inputs = [
         "queries",
         "keys",
@@ -499,6 +452,19 @@ def _make_batched_sdpa_2pass_partials_kernel(*, has_mask: bool = False):
     ]
     if has_mask:
         inputs.append("mask")
+        mask_setup = """
+        auto mask_ = mask + (((b_idx * Hq + q_head_idx) * M_FIXED + q_seq_idx) * N + block_idx);
+        """
+        mask_use_key = """
+            auto mask_value = static_cast<float>(mask_[0]);
+            use_key = use_key && (mask_value >= Limits<InT>::finite_min);
+        """
+        mask_score = """
+            score += static_cast<float>(mask_[0]);
+        """
+        mask_advance = """
+            mask_ += blocks;
+        """
 
     source = f"""
         constexpr int BD = 32;
@@ -552,26 +518,25 @@ def _make_batched_sdpa_2pass_partials_kernel(*, has_mask: bool = False):
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             bool use_key = (n <= (N - M_FIXED + q_seq_idx));
-            {mask_gate}
+            {mask_use_key}
 
-            // Compute score unconditionally; select kills contribution when !use_key.
-            float score = 0.0f;
-            for (int i = 0; i < qk_per_thread; ++i) {{
-                score += q[i] * static_cast<float>(tg_k[simd_lid * qk_per_thread + i]);
-            }}
-            score = simd_sum(score);
-            {mask_score}
-            // Blend to -inf when use_key==false — no branch in execution.
-            score = metal::select(Limits<float>::finite_min, score, use_key);
+            if (use_key) {{
+                float score = 0.0f;
+                for (int i = 0; i < qk_per_thread; ++i) {{
+                    score += q[i] * static_cast<float>(tg_k[simd_lid * qk_per_thread + i]);
+                }}
+                score = simd_sum(score);
+                {mask_score}
 
-            float new_max = metal::max(max_score, score);
-            float factor = fast::exp(max_score - new_max);
-            float exp_score = fast::exp(score - new_max);
+                float new_max = metal::max(max_score, score);
+                float factor = fast::exp(max_score - new_max);
+                float exp_score = fast::exp(score - new_max);
 
-            max_score = new_max;
-            sum_exp_score = sum_exp_score * factor + exp_score;
-            for (int i = 0; i < v_per_thread; ++i) {{
-                o[i] = o[i] * factor + exp_score * static_cast<float>(tg_v[simd_lid * v_per_thread + i]);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * factor + exp_score;
+                for (int i = 0; i < v_per_thread; ++i) {{
+                    o[i] = o[i] * factor + exp_score * static_cast<float>(tg_v[simd_lid * v_per_thread + i]);
+                }}
             }}
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -595,7 +560,6 @@ def _make_batched_sdpa_2pass_partials_kernel(*, has_mask: bool = False):
         output_names=["partials", "sums", "maxs"],
         source=source,
     )
-
 
 def _make_batched_sdpa_2pass_reduce_kernel():
     if not mx.metal.is_available():
@@ -647,13 +611,11 @@ def _make_batched_sdpa_2pass_reduce_kernel():
             partials += BN * V;
         }
 
-        // Branchless reciprocal: avoid division-by-zero via max with epsilon.
-        float inv_sum = 1.0f / metal::max(sum_exp_score, 1e-9f);
-
         for (int i = 0; i < elem_per_thread; ++i) {
             outputs[simd_lid * BD + simd_gid] = o[i];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]) * inv_sum;
+            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+            o[i] = sum_exp_score == 0.0f ? o[i] : (o[i] / sum_exp_score);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
@@ -671,7 +633,6 @@ def _make_batched_sdpa_2pass_reduce_kernel():
         source=source,
     )
 
-
 _batched_sdpa_2pass_partials_kernel = _make_batched_sdpa_2pass_partials_kernel(
     has_mask=False
 )
@@ -679,7 +640,6 @@ _batched_sdpa_2pass_partials_kernel_masked = _make_batched_sdpa_2pass_partials_k
     has_mask=True
 )
 _batched_sdpa_2pass_reduce_kernel = _make_batched_sdpa_2pass_reduce_kernel()
-
 
 def batched_sdpa_2pass_exact(
     queries: mx.array,

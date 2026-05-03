@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">dflash-mlx</h1>
-  <p align="center">DFlash speculative decoding for Apple Silicon</p>
+  <p align="center">DFlash speculative decoding for Apple Silicon (MLX)</p>
 </p>
 
 <p align="center">
@@ -15,23 +15,26 @@ Paper: [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.or
 Block-diffusion draft generates 16 tokens in one pass. Target verifies in one pass. Output is lossless — every emitted token is verified against the target model before it is committed.
 
 https://github.com/user-attachments/assets/a9be2b48-3264-4970-b836-c876b0b7fdda
- 
+
 ## How it works
 
 - A small draft model (~1B params) generates 16 tokens in parallel with block diffusion.
 - The target model verifies those 16 tokens in a single forward pass.
 - Greedy acceptance keeps the correct prefix and rejects the rest.
 - Lossless: every emitted token is the target model's greedy argmax at verification time. Output can still differ from pure AR because of MLX dispatch divergence, but no unverified token is ever emitted.
-- Uses stock MLX plus a small number of targeted kernels where rollback and long-context verify need tighter numerical control.
+- Built on stock MLX with a small number of targeted Metal kernels where rollback and long-context verify need tighter numerical control.
 
 ## Technical details
 
-- **Tape-replay rollback**: instead of snapshotting and restoring the full GatedDeltaNet state, dflash-mlx records an innovation tape during verify and replays only the accepted steps through a custom Metal kernel. Keeps rollback cost low and preserves acceptance over long generations.
-- **JIT SDPA 2-pass**: long-context verify (`N >= 1024`) uses a custom Metal attention kernel that stays numerically aligned with stock MLX attention.
-- **Verify-specialized int4 qmm** (`verify_qmm`): custom Metal simdgroup-MMA kernel for the M=16 quantized matmul that dominates the target verify step. Two shape-adaptive variants (`mma2big`, `mma2big_pipe` with K-split + double-buffered staging). Auto-enabled on MoE targets and dense models with ≥40 layers where the M=16 specialization amortizes over enough layers to beat stock `mx.quantized_matmul` end-to-end. Opt-in override via `DFLASH_VERIFY_LINEAR={0,1}`.
-- **Numerical coherence**: bf16-sensitive paths, including recurrent state replay and small projections, are stabilized across speculative cycles so accepted tokens stay consistent.
+- **Tape-replay rollback** — instead of snapshotting and restoring the full GatedDeltaNet state, dflash-mlx records an innovation tape during verify and replays only the accepted steps through a custom Metal kernel. Keeps rollback cost low and preserves acceptance over long generations.
+- **JIT SDPA 2-pass** — long-context verify (`N >= 1024`) uses a custom Metal attention kernel that stays numerically aligned with stock MLX attention.
+- **Verify-specialized int4 qmm** (`verify_qmm`) — custom Metal simdgroup-MMA kernel for the M=16 quantized matmul that dominates the target verify step. Two shape-adaptive variants (`mma2big`, `mma2big_pipe` with K-split + double-buffered staging). Auto-enabled on MoE targets and dense models with ≥40 layers.
+- **Numerical coherence** — bf16-sensitive paths, including recurrent state replay and small projections, are stabilized across speculative cycles so accepted tokens stay consistent.
+- **Prefix cache (L1+L2)** — RAM snapshots of target KV + GDN recurrent state + captured hidden + last logits, with optional SSD spill, byte/entry budgets, and automatic eviction. Hits skip prefill on revisited prompts. This hot/cold cache hierarchy is inspired by [oMLX](https://github.com/jundot/omlx)'s tiered KV cache work, but dflash-mlx stores DFlash prefix snapshots rather than active paged-KV blocks.
 
 ## Benchmarks
+
+Apple M5 Max, 64 GB unified memory, MLX 0.31.1. Protocol: stock `mlx_lm.stream_generate` baseline vs DFlash, sequential, 3 repeats, median, 60s cooldown. Generation prompt: `"The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}."`
 
 | Model | Tokens | Baseline | DFlash | Speedup | Acceptance |
 |-------|--------|----------|--------|---------|------------|
@@ -56,69 +59,62 @@ https://github.com/user-attachments/assets/a9be2b48-3264-4970-b836-c876b0b7fdda
 | Qwen3.6-35B-A3B-4bit | 4096 | 134.50 tok/s | 208.40 tok/s | 1.56x | 88.43% |
 | Qwen3.6-35B-A3B-4bit | 8192 | 133.20 tok/s | 177.45 tok/s | 1.33x | 87.01% |
 
-### Methodology
-
-Hardware: Apple M5 Max, 64GB unified memory. MLX 0.31.1 from the stock pip install.
-
-Protocol: stock `mlx_lm.stream_generate` on a pristine target model vs stock MLX plus the local DFlash runtime, measured sequentially. `3` repeats, median reported, `60s` cooldown between measured runs.
-
-Generation: prompt `"The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}."` with chat templates enabled by default and post-prefill tok/s as the primary metric.
-
-Full per-run JSON reports are available in [`benchmark/results/`](benchmark/results/).
+Per-run JSON: [`benchmark/results/`](benchmark/results/). Reproduce on your hardware with `dflash benchmark`.
 
 ## Install
 
 ```bash
 pip install dflash-mlx
-
-# or with pipx
-pipx install dflash-mlx
 ```
 
-`dflash-serve` wraps `mlx_lm.server` for full OpenAI-compatible serving semantics, including tools, reasoning, and streaming, while using the DFlash runtime as the generation engine.
+Optional benchmark dataset support:
+
+```bash
+pip install "dflash-mlx[bench]"
+```
 
 ## Quick start
 
 ```bash
 PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
 
-# Generate — draft auto-resolved
-dflash --model Qwen/Qwen3.5-9B --prompt "$PROMPT"
+# One-shot generation, draft auto-resolved
+dflash generate --model Qwen/Qwen3.5-9B --prompt "$PROMPT"
 
-# Explicit draft model
-dflash --model Qwen/Qwen3.5-9B --draft z-lab/Qwen3.5-9B-DFlash --prompt "$PROMPT"
+# Server (OpenAI-compatible)
+dflash serve \
+  --model mlx-community/Qwen3.6-27B-4bit \
+  --draft z-lab/Qwen3.6-27B-DFlash \
+  --port 8000
 
-# Server
-dflash-serve --model Qwen/Qwen3.5-9B --port 8000
-
-# Disable visible thinking/reasoning on models that support it
-dflash-serve --model Qwen/Qwen3.5-9B --port 8000 \
-  --chat-template-args '{"enable_thinking": false}'
-
-# Raise the DFlash fallback threshold for longer prompts
-dflash-serve --model mlx-community/Qwen3.5-35B-A3B-4bit --port 8000 \
-  --chat-template-args '{"enable_thinking": false}' \
-  --dflash-max-ctx 16384
-
-# Benchmark
-dflash-benchmark --model Qwen/Qwen3.5-9B --draft z-lab/Qwen3.5-9B-DFlash \
-  --prompt "$PROMPT" --max-tokens 1024 --repeat 3
-
-# Live demo — baseline vs DFlash side-by-side
-PYTHONPATH=. python3 -m examples.demo --mode dflash \
-  --target-model Qwen/Qwen3.5-9B --draft-model z-lab/Qwen3.5-9B-DFlash \
-  --prompt "$PROMPT" --max-tokens 2048
+# Local benchmark
+dflash benchmark --suite smoke --model Qwen/Qwen3.5-4B
 ```
 
-- Compatible with Open WebUI, Continue, OpenCode, aider, and other OpenAI-compatible clients
-- Streaming SSE support
-- `dflash-serve` requires a supported DFlash draft model (auto-detected from the registry or passed explicitly with `--draft`)
+Send a request:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"mlx-community/Qwen3.6-27B-4bit\",
+    \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
+    \"max_tokens\": 1024,
+    \"stream\": true
+  }"
+```
+
+Compatible with OpenCode, aider, Continue, Open WebUI, and any OpenAI-compatible client. Tool calls, streaming, and chat templates all flow through. Short responses may take the target-only fast path; pass `--fastpath-max-tokens 0` to force DFlash on every request.
+
+Enable Qwen reasoning mode when needed:
+
+```bash
+dflash serve --model mlx-community/Qwen3.6-27B-4bit --enable-thinking
+```
 
 ## Tested models
 
-Any model with a DFlash draft on HuggingFace should work.
-
-Optimized for Qwen3.5 / Qwen3.6 models (hybrid GatedDeltaNet + attention architecture). Qwen3 (pure attention) models work, but without the precision benefits of tape-replay rollback.
+Optimized for Qwen3.5 / Qwen3.6 hybrid GatedDeltaNet + attention targets. Qwen3 (pure attention) targets work but skip the tape-replay rollback path.
 
 | Target | Draft |
 |--------|-------|
@@ -126,22 +122,93 @@ Optimized for Qwen3.5 / Qwen3.6 models (hybrid GatedDeltaNet + attention archite
 | [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) | [z-lab/Qwen3.5-9B-DFlash](https://huggingface.co/z-lab/Qwen3.5-9B-DFlash) |
 | [mlx-community/Qwen3.5-27B-4bit](https://huggingface.co/mlx-community/Qwen3.5-27B-4bit) | [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) |
 | [mlx-community/Qwen3.5-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.5-35B-A3B-4bit) | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) |
+| [mlx-community/Qwen3.6-27B-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit) | [z-lab/Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) |
 | [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) | [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) |
+| [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) |
+| [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | [z-lab/Qwen3-8B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) |
 
-Models without a matching DFlash draft are rejected. Pass `--draft` explicitly if you want to override the registry.
+```bash
+dflash models
+```
+
+Models without a matching DFlash draft are rejected. Pass `--draft` explicitly to override the registry.
+
+## CLI
+
+```
+dflash serve      # OpenAI-compatible server
+dflash generate   # one-shot local generation
+dflash benchmark  # baseline-vs-DFlash runtime benchmark
+dflash doctor     # environment and config checks
+dflash profiles   # list runtime presets
+dflash models     # list supported target/draft pairs
+```
+
+## Profiles
+
+Readable defaults. Explicit CLI flags override them.
+
+| Profile | Prefill | Prefix cache | L1 budget | L2 | Intent |
+|---|---:|---|---|---|---|
+| `balanced` | 4096 | on | 4 / 8 GiB | off | default coding sessions |
+| `fast` | 8192 | on | 4 / 16 GiB | off | throughput first |
+| `low-memory` | 1024 | on | 2 / 2 GiB | off | lower memory pressure |
+| `long-session` | 4096 | on | 8 / 8 GiB | on / 50 GiB | prefix revisits |
+
+```bash
+dflash profiles
+dflash serve --profile fast --model Qwen/Qwen3.5-9B
+dflash serve --profile long-session --model mlx-community/Qwen3.6-27B-4bit \
+  --prefix-cache-l2-dir .artifacts/dflash/l2
+```
+
+## Common server controls
+
+```bash
+# Force DFlash even for short responses
+dflash serve --model Qwen/Qwen3.5-9B --fastpath-max-tokens 0
+
+# Tune prefill batching
+dflash serve --model Qwen/Qwen3.5-9B --prefill-step-size 8192
+
+# Diagnostics
+dflash serve --model Qwen/Qwen3.5-9B --diagnostics basic   # request + cache events
+dflash serve --model Qwen/Qwen3.5-9B --diagnostics full    # + memory waterfall + cycle timings
+
+# Bound L1 prefix snapshots
+dflash serve --model Qwen/Qwen3.5-9B \
+  --prefix-cache-max-entries 2 \
+  --prefix-cache-max-bytes 2GB
+
+# Enable SSD L2 spill
+dflash serve --model Qwen/Qwen3.5-9B \
+  --prefix-cache-l2 \
+  --prefix-cache-l2-dir .artifacts/dflash/l2 \
+  --prefix-cache-l2-max-bytes 50GB
+```
+
+Diagnostics artifacts land in `.artifacts/dflash/diagnostics/<timestamp>-serve-<mode>/`. `basic` writes request and cache events; `full` adds the memory waterfall and per-cycle timings. Use `full` for diagnosis, not for throughput claims.
 
 ## Features
 
-- **Auto draft resolution** — no manual `--draft` flag needed
-- **Streaming** — token-by-token output in the CLI and server
+- **Auto draft resolution** — no manual `--draft` flag needed for registered targets
+- **Streaming** — token-by-token output (CLI + SSE)
 - **Chat templates** — enabled by default
 - **Recurrent rollback** — `RecurrentRollbackCache` keeps GatedDeltaNet state coherent across speculative verify and rollback
-- **Verify-specialized int4 qmm kernel** — custom M=16 Metal kernel auto-enabled on MoE and dense ≥40-layer targets; falls back to stock `mx.quantized_matmul` everywhere else
+- **Verify-specialized int4 qmm** — custom M=16 Metal kernel auto-enabled on MoE and dense ≥40-layer targets; falls back to stock `mx.quantized_matmul` everywhere else
+- **Prefix cache L1+L2** — RAM snapshots with optional SSD spill, budget-based eviction, and hybrid-architecture support
+- **Diagnostics** — opt-in structured artifacts under `.artifacts/dflash/diagnostics/`
 
 ## Roadmap
 
-- Sustained acceptance at 4096+ tokens — draft KV cache window scaling and long-context verify optimization
-- Draft model distillation and compression for faster draft forward
+- **Adaptive block size** — vary draft block length per cycle based on observed acceptance regime instead of a fixed 16
+- **Architecture backends beyond Qwen GDN** — support Gemma/Llama-style targets
+  with family-specific cache layout, attention masks, logits post-processing,
+  hidden capture, rollback/trim behavior, and parity tests.
+- **Kernel work where it matters** — optimize family-specific hot paths only
+  after the backend contract and parity tests are stable.
+- **Tool-call regime auto-fallback** — switch to target-only AR when speculative surplus goes negative on structured outputs
+- **Sustained acceptance at long context** — draft KV cache window scaling and long-context verify optimization
 
 ## Citation
 

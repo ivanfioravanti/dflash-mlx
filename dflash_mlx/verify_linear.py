@@ -1,15 +1,20 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
+
 from __future__ import annotations
 
-import os
 from typing import Callable, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 
+from dflash_mlx.internal_debug import (
+    verify_include as _debug_verify_include,
+    verify_max_n as _debug_verify_max_n,
+    verify_qmm_enabled as _debug_verify_qmm_enabled,
+)
 from dflash_mlx.verify_qmm import (
     verify_matmul,
     _auto_variant,
@@ -19,16 +24,7 @@ from dflash_mlx.verify_qmm import (
     _build_kernel_mma2big_pipe_8bit,
 )
 
-
 _VERIFY_MAX_N_DEFAULT = 100_000
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except ValueError:
-        return default
-
 
 _PROJ_TAGS = {
     "mlp.gate_proj":        "mlp_gate",
@@ -43,13 +39,11 @@ _PROJ_TAGS = {
     "linear_attn.out_proj":    "gdn_o",
 }
 
-
 def _path_tag(path: str) -> str:
     for suffix, tag in _PROJ_TAGS.items():
         if path.endswith(suffix):
             return tag
     return "other"
-
 
 def is_verify_eligible(ql: nn.QuantizedLinear, path: str = "") -> bool:
     if not isinstance(ql, nn.QuantizedLinear):
@@ -65,9 +59,9 @@ def is_verify_eligible(ql: nn.QuantizedLinear, path: str = "") -> bool:
     K = int(w.shape[1]) * (32 // ql.bits)
     if N % 32 != 0 or K % 32 != 0:
         return False
-    if N >= _env_int("DFLASH_VERIFY_MAX_N", _VERIFY_MAX_N_DEFAULT):
+    if N >= _debug_verify_max_n(_VERIFY_MAX_N_DEFAULT):
         return False
-    include = os.environ.get("DFLASH_VERIFY_INCLUDE", "all").strip().lower()
+    include = _debug_verify_include()
     if include not in ("", "all"):
         tag = _path_tag(path)
         allowed = {s.strip() for s in include.split(",") if s.strip()}
@@ -81,11 +75,15 @@ def is_verify_eligible(ql: nn.QuantizedLinear, path: str = "") -> bool:
             return False
     return True
 
-
 class VerifyQuantizedLinear(nn.QuantizedLinear):
 
     @classmethod
-    def from_quantized(cls, ql: nn.QuantizedLinear) -> "VerifyQuantizedLinear":
+    def from_quantized(
+        cls,
+        ql: nn.QuantizedLinear,
+        *,
+        enable_qmm: Optional[bool] = None,
+    ) -> "VerifyQuantizedLinear":
         obj = cls.__new__(cls)
         nn.Module.__init__(obj)
         obj.group_size = ql.group_size
@@ -98,7 +96,7 @@ class VerifyQuantizedLinear(nn.QuantizedLinear):
         if "bias" in ql:
             obj.bias = ql.bias
 
-        object.__setattr__(obj, "_call_fn", _build_dispatch(obj))
+        object.__setattr__(obj, "_call_fn", _build_dispatch(obj, enable_qmm=enable_qmm))
 
         obj.freeze()
         return obj
@@ -106,8 +104,11 @@ class VerifyQuantizedLinear(nn.QuantizedLinear):
     def __call__(self, x: mx.array) -> mx.array:
         return self._call_fn(x)
 
-
-def _build_dispatch(obj: "VerifyQuantizedLinear"):
+def _build_dispatch(
+    obj: "VerifyQuantizedLinear",
+    *,
+    enable_qmm: Optional[bool] = None,
+):
     w = obj.weight
     s = obj.scales
     b = getattr(obj, "biases", None)
@@ -120,22 +121,19 @@ def _build_dispatch(obj: "VerifyQuantizedLinear"):
     N = int(w.shape[0])
     K = int(w.shape[1]) * (32 // bits)
 
-    # Fast path: pre-resolve kernel + pre-contiguous fixed tensors at install
-    # time so each forward call only needs contiguous(x) + one dtype branch.
-    # Eliminates: _should_use_verify, _auto_variant, _variant() env lookup,
-    # mx.contiguous for weights/scales/biases, and shape alignment checks.
-    if (
-        os.environ.get("DFLASH_VERIFY_QMM", "") == "1"
-        and N % 32 == 0
-        and K % 32 == 0
-    ):
+    qmm_enabled = (
+        _debug_verify_qmm_enabled()
+        if enable_qmm is None
+        else bool(enable_qmm)
+    )
+
+    if qmm_enabled and N % 32 == 0 and K % 32 == 0:
         variant, auto_kp = _auto_variant(K, N)
         K_PARTS = auto_kp
         if variant == "mma2big_pipe" and K % (32 * K_PARTS) != 0:
             variant = "mma2big"
             K_PARTS = 1
 
-        # Force fixed tensors contiguous once so the closure never has to.
         w_c = mx.contiguous(w)
         s_c = mx.contiguous(s)
         b_c = mx.contiguous(b) if b is not None else b
@@ -211,8 +209,6 @@ def _build_dispatch(obj: "VerifyQuantizedLinear"):
                                            transpose=True, group_size=gs, bits=bits, mode=mode)
         return call
 
-    # Fallback: runtime dispatch through verify_matmul (handles disabled env,
-    # non-aligned shapes, future bits values, etc.)
     if has_bias:
         def call(x):
             m = 1
@@ -235,14 +231,7 @@ def _build_dispatch(obj: "VerifyQuantizedLinear"):
                                        transpose=True, group_size=gs, bits=bits, mode=mode)
     return call
 
-
 def prewarm_verify_kernels(model: nn.Module) -> int:
-    """Trigger Metal shader compilation for all installed VerifyQuantizedLinear layers.
-
-    Runs a dummy M=16 forward pass through one layer per unique (K, N, bits, gs)
-    shape so Metal compiles the kernel JIT before generation begins, eliminating
-    first-cycle latency.  Returns the number of unique shapes warmed.
-    """
     from mlx.utils import tree_flatten
 
     seen: set[tuple] = set()
@@ -261,11 +250,11 @@ def prewarm_verify_kernels(model: nn.Module) -> int:
         warmed += 1
     return warmed
 
-
 def install_verify_linears(
     model: nn.Module,
     *,
     predicate: Optional[Callable[[str, nn.QuantizedLinear], bool]] = None,
+    enable_qmm: Optional[bool] = None,
 ) -> int:
     if predicate is None:
         predicate = lambda path, m: is_verify_eligible(m, path=path)
@@ -278,14 +267,13 @@ def install_verify_linears(
             return m
         if isinstance(m, nn.QuantizedLinear) and predicate(path, m):
             count += 1
-            return VerifyQuantizedLinear.from_quantized(m)
+            return VerifyQuantizedLinear.from_quantized(m, enable_qmm=enable_qmm)
         return m
 
     leaves = model.leaf_modules()
     leaves = tree_map_with_path(_maybe_swap, leaves, is_leaf=nn.Module.is_module)
     model.update_modules(leaves)
     return count
-
 
 def uninstall_verify_linears(model: nn.Module) -> int:
     count = 0

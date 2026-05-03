@@ -1,0 +1,227 @@
+# Benchmarking
+
+Use `dflash benchmark` for public local performance claims. Keep lab harnesses
+separate from product claims.
+
+## Public Runtime Benchmark
+
+```bash
+dflash benchmark --suite smoke --model Qwen/Qwen3.5-4B
+```
+
+Default protocol:
+
+1. load target and matching DFlash draft;
+2. resolve a deterministic prompt suite;
+3. render/tokenize each prompt once;
+4. run baseline MLX first;
+5. run DFlash second using the same prompt token ids;
+6. repeat according to `--repeat`;
+7. write artifacts under `.artifacts/dflash/benchmarks/...`.
+
+This command is for local runtime numbers and regression checks. It is not an
+agentic benchmark and not an accuracy leaderboard.
+
+## Public Runtime Suites
+
+| Suite | Purpose | Default limit |
+| --- | --- | ---: |
+| `smoke` | cheap sanity check, closest to the original benchmark prompt | 1 |
+| `humaneval` | `openai_humaneval`, split `test`, field `prompt` | 10 |
+| `gsm8k` | `gsm8k`, config `main`, split `test`, formatted as question/answer | 10 |
+| `math500` | `HuggingFaceH4/MATH-500`, split `test`, formatted as problem/solution | 10 |
+| `longctx` | synthetic long-context prompt for prefill/memory/cache stress | 1 |
+
+`humaneval`, `gsm8k`, and `math500` use real Hugging Face datasets through the
+optional `datasets` package (`pip install 'dflash-mlx[bench]'`). First use may
+download or populate the local HF cache. They are still runtime prompt suites:
+they measure DFlash speed, memory, acceptance, and cache behavior on familiar
+prompt shapes. They do not report official HumanEval pass@1, GSM8K exact match,
+Math500 accuracy, or any other accuracy score.
+
+`smoke` and `longctx` remain local/offline. No hand-written fake benchmark
+prompts are embedded for `humaneval`, `gsm8k`, or `math500`.
+
+## Important Defaults
+
+| Setting | Default |
+| --- | --- |
+| suite | `smoke` |
+| prompt limit | `1` for `smoke`/`longctx`, `10` otherwise |
+| chat template | enabled |
+| generated tokens | `64` |
+| block tokens | `16` |
+| repeat | `1` |
+| cooldown | `10` seconds |
+| memory summary | enabled |
+| split-SDPA in benchmark | enabled |
+| output dir | `.artifacts/dflash/benchmarks/<timestamp>-<suite>-<model>` |
+
+`--suite longctx --ctx-tokens INT` builds an approximate synthetic long-context
+prompt. It is useful for cheap stress testing, but it is not the same as a real
+multi-turn coding agent session.
+
+HF suite selection is deterministic by default: no shuffle, first `--limit` rows
+from the split. Use `--shuffle --seed INT` to shuffle explicitly before the
+limit is applied. The manifest records shuffle, seed, dataset id/config/split,
+selected row indices, and selected prompt ids.
+
+## Benchmark Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--suite {smoke,humaneval,gsm8k,math500,longctx}` | named runtime prompt suite |
+| `--limit N` | deterministic prompt count limit |
+| `--ctx-tokens N` | synthetic context target for `longctx` |
+| `--prompt-file PATH` | JSONL prompt override, rows contain `id`, `suite`, `prompt` |
+| `--shuffle` | shuffle HF dataset rows before applying `--limit` |
+| `--seed INT` | shuffle seed used only with `--shuffle` |
+| `--prompt TEXT` | prompt text |
+| `--ctx INT` | existing shorthand for `--ctx-tokens` |
+| `--max-tokens INT` | generation length |
+| `--block-tokens INT` | DFlash verify block size |
+| `--repeat INT` | measured runs |
+| `--cooldown SECONDS` | sleep between runs |
+| `--model REF_OR_PATH` | target model |
+| `--draft REF_OR_PATH` | draft override |
+| `--no-chat-template` | raw prompt text |
+| `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
+| `--no-eos` | suppress EOS for fixed-length runs |
+| `--split-sdpa`, `--no-split-sdpa` | benchmark verifier split-SDPA mode |
+| `--target-fa-window INT` | experimental target FA rotating window |
+| `--draft-sink-size INT` | draft cache sink tokens |
+| `--draft-window-size INT` | draft cache rolling window tokens |
+| `--verify-len-cap INT` | max tokens per verify forward |
+| `--no-memory` | omit memory medians |
+| `--out PATH` | artifact directory |
+
+## Artifacts
+
+Each public benchmark run writes:
+
+- `manifest.json` - repo/runtime metadata;
+- `invocation.json` - command, model refs, prompt token mode, protocol;
+- `results.json` - raw per-prompt metrics plus aggregate metrics;
+- `runs.jsonl` - per-run measurements;
+- `summary.json` - aggregate numbers;
+- `summary.md` - human-readable report.
+
+The artifact directory is local by default. New raw benchmark outputs should not
+be committed.
+
+## Legacy Results
+
+`benchmark/results/*.json` contains pinned historical JSON reports. They are
+kept as legacy evidence and are not the default destination for new runs.
+
+When quoting an old result, quote the file path and its recorded git hash. When
+quoting a new result, quote the `.artifacts/...` directory.
+
+## Lab Harnesses
+
+`tools/benchmarks/` contains private/lab harnesses:
+
+- agentic trace/session/proxy tooling;
+- prefix-cache and L2 probes;
+- trace analyzers;
+- OpenCode/pi trace harnesses.
+
+These tools are useful for diagnosis, but their outputs are not public claims
+unless the run directory records enough context to reproduce the command and
+environment.
+
+Rules:
+
+- use `dflash benchmark` first for public smoke checks;
+- use lab harnesses to answer one specific mechanism question;
+- do not compare numbers from different harnesses as if they were one protocol;
+- do not use full cycle tracing for performance claims;
+- benchmark sequentially, never with two heavy model loads in parallel.
+
+## Good Command Patterns
+
+Small smoke:
+
+```bash
+dflash benchmark --suite smoke --model Qwen/Qwen3.5-4B --max-tokens 64
+```
+
+HumanEval-style runtime prompts:
+
+```bash
+dflash benchmark --suite humaneval --limit 10 --model Qwen/Qwen3.5-4B
+```
+
+GSM8K-style runtime prompts:
+
+```bash
+dflash benchmark --suite gsm8k --limit 10 --model Qwen/Qwen3.5-4B
+```
+
+Math500-style runtime prompts:
+
+```bash
+dflash benchmark --suite math500 --limit 10 --model Qwen/Qwen3.5-4B
+```
+
+Fixed-length decode:
+
+```bash
+dflash benchmark \
+  --suite smoke \
+  --model Qwen/Qwen3.5-4B \
+  --max-tokens 128 \
+  --no-eos
+```
+
+Synthetic context stress:
+
+```bash
+dflash benchmark \
+  --suite longctx \
+  --model Qwen/Qwen3.5-4B \
+  --ctx-tokens 65536 \
+  --max-tokens 64 \
+  --out .artifacts/dflash/benchmarks/manual-64k
+```
+
+External prompt file:
+
+```bash
+dflash benchmark \
+  --suite gsm8k \
+  --prompt-file data/gsm8k_sample.jsonl \
+  --limit 100 \
+  --model Qwen/Qwen3.5-4B
+```
+
+`--prompt-file` is the offline/custom path and bypasses Hugging Face dataset
+loading even when `--suite` is `humaneval`, `gsm8k`, or `math500`.
+
+Low-memory runtime check:
+
+```bash
+dflash benchmark \
+  --suite smoke \
+  --model Qwen/Qwen3.5-4B \
+  --draft-sink-size 64 \
+  --draft-window-size 1024 \
+  --verify-len-cap 0 \
+  --target-fa-window 0
+```
+
+## Reading Results
+
+Look at:
+
+- baseline tokens/sec;
+- DFlash tokens/sec;
+- speedup versus baseline;
+- TTFT;
+- acceptance rate;
+- tokens per cycle;
+- peak memory if enabled;
+- prompt token count and whether chat template was enabled.
+
+Do not interpret DFlash speed without acceptance and tokenization regime. A raw
+prompt and a chat-template prompt are different benchmark inputs.
